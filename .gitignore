@@ -2,6 +2,12 @@
 .Rhistory
 .Rapp.history
 
+# USGS gage data and others
+/data/dss/
+
+# R 4.0.3 w/ DSS and HEC-DSSVue dependencies for loading DSS data
+/resources/
+
 # Session Data files
 .RData
 
