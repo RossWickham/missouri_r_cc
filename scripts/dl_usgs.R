@@ -20,6 +20,8 @@ try({
 
 
 library(dataRetrieval)
+library(lubridate)
+library(parallel)
 library(raster)
 library(rgdal)
 library(tidyverse)
@@ -29,9 +31,7 @@ library(openxlsx)
 ### Config --------------------------------------------------------------------
 
 # Point this file to the HUC basin shapefile
-basinFileName <- paste0("N:\\EC-H\\HYDROLOGY SECTION\\Wickham\\projects\\",
-                        "2022-02_Missouri_R_CC\\data\\vector\\",
-                        "WBDHU4_MissouriR_Project.shp")
+basinFileName <- paste0("data\\vector\\WBDHU4_MissouriR_Project.shp")
 
 # Which states to look at USGS gages
 # Montana, N Dakota, S Dakota, Wyoming, Minnesota, Nebraska,
@@ -43,7 +43,10 @@ proj4StringWGS84 <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
 
 # Save location of metadata file 
 # May want to switch to RData once convert to RProj
-metaSaveFileName <- "D:/temp/missouri_usgs.xlsx"
+metaSaveFileName <- "data/rdata/missouri_usgs_metadata.RData"
+
+# Save location for DSS data
+dssFileName <- file.path(getwd(), "data/dss/missouri_usgs_raw.dss")
 
 ### Functions -----------------------------------------------------------------
 
@@ -112,10 +115,10 @@ unlistWithNames <- function(l, valueColname = "value", listColName = "name"){
 #' @param fPart    String, F part of DSS path
 #' @return Java object, TimeSeriesMath
 usgsDvToHecMath <- function(usgsDvDf,
-                        aPart = "",
-                        bPart = "TEST",
-                        cPart = "FLOW",
-                        fPart = "EXAMPLE"){
+                            aPart = "",
+                            bPart = "TEST",
+                            cPart = "FLOW",
+                            fPart = "EXAMPLE"){
   tryCatch({
     
     usgsDvDf <- na.omit(usgsDvDf)
@@ -167,7 +170,7 @@ usgsDvToHecMath <- function(usgsDvDf,
     # dssFile$put(tsc)
     # head(usgsDvDf)
     # tail(usgsDvDf)
-
+    
     # Convert to TimeSeriesMath
     hm <- .jnew("hec/hecmath/TimeSeriesMath")
     hm <- hm$createInstance(tsc)
@@ -189,27 +192,29 @@ loadBasinShp <- function(basinFileName){
 # Load metadata for all USGS river gages in each defined state that
 #   have daily discharge data, bind to single dataframe
 getUSGSstateMeta <- function(states){
-  usgsMeta <-
-    states %>%
-    Map(whatNWISdata,
-        stateCd = .,
-        parameterCd = list("00060"),
-        service = "dv") %>%
+  cl <- makeCluster(detectCores() - 1)
+  out <- clusterMap(cl = cl,
+                    fun = whatNWISdata,
+                    stateCd = states,
+                    parameterCd = list("00060"),
+                    service = "dv")
+  stopCluster(cl)
+  out %>%
     bind_rows()
 }
 
 getGageMetaData <- function(basinFileName, states, metaSaveFileName){
-  basinShp <- loadBasinShp(basinFileName)
-  usgsMeta <- getUSGSstateMeta(states)
-  
   if(file.exists(metaSaveFileName)){
     load(metaSaveFileName)
     return(gageMeta)
   }
   
+  basinShp <- loadBasinShp(basinFileName)
+  usgsMeta <- getUSGSstateMeta(states)
+  
   # For each basin polygon, get the index of corresponding 
   #   USGS gages in the stateMeta data.frame via whichPointsInPolygon
-  basinShp %>%
+  gageMeta <- basinShp %>%
     split(1:nrow(.)) %>%
     Map(f = whichPointsInPolygon, 
         pointsX = list(usgsMeta$dec_long_va),
@@ -222,6 +227,9 @@ getGageMetaData <- function(basinFileName, states, metaSaveFileName){
     unlistWithNames(valueColname = "site_no", listColName = "basin") %>%
     # Merge with original USGS gage metadata
     merge(y = usgsMeta, by = "site_no", all.x = T)
+  # Save data
+  save(gageMeta, file = metaSaveFileName)
+  gageMeta
 }
 
 ### Load Metadata -------------------------------------------------------------
@@ -233,23 +241,28 @@ gageMeta <- getGageMetaData(basinFileName, states, metaSaveFileName)
 
 # Write out metadata to file
 try({
-  write.xlsx(x = gageMeta, file = metaSaveFileName)
+  write.xlsx(x = gageMeta,
+             file = file.path("data/tabular",
+                              metaSaveFileName %>%
+                                tools::file_path_sans_ext() %>%
+                                basename() %>%
+                                str_c(".xlsx", collapse=""))
+  )
 })
 
 
 
 # Assign geospatial coordinates and projection
-coordinates(gageMeta) <- ~dec_long_va+dec_lat_va
-crs(gageMeta) <- proj4StringWGS84
-
-plot(basinShp)
-box(); axis(1); axis(2)
-points(gageMeta, pch=3, cex=0.1)
-text(-100,50,sprintf("# Sites = %g", length(unique(gageMeta$site_no))))
+# coordinates(gageMeta) <- ~dec_long_va+dec_lat_va
+# crs(gageMeta) <- proj4StringWGS84
+# plot(basinShp)
+# box(); axis(1); axis(2)
+# points(gageMeta, pch=3, cex=0.1)
+# text(-100,50,sprintf("# Sites = %g", length(unique(gageMeta$site_no))))
 
 ### Download and Save ---------------------------------------------------------
 
-dssFileName <- "D:/temp/missouri_usgs_raw.dss"
+
 dssFile <- opendss(dssFileName)
 
 # Iterate through each basin, save all USGS gage data to DSS
@@ -268,8 +281,14 @@ for(basin in unique(gageMeta$basin)){
     )
   
   # Download USGS data to list of data.frames
-  dfList <- pmap(.l = subMeta[, c("siteNumbers", "parameterCd")],
-                 .f = readNWISdv)
+  system.time({
+    cl <- makeCluster(detectCores() - 1)
+    dfList <- clusterMap(cl = cl,
+                         fun = readNWISdv,
+                         siteNumbers = subMeta$siteNumbers,
+                         parameterCd = subMeta$parameterCd)
+    stopCluster(cl)
+  })
   
   # Convert data.frames to Java HecMath objects and save
   Map(f = usgsDvToHecMath,
@@ -280,9 +299,42 @@ for(basin in unique(gageMeta$basin)){
       fPart = sprintf("USGS %s", subMeta$siteNumbers)) %>%
     compact() %>%
     map(.f = dssFile$write)
-
+  
 }
 dssFile$close()
 
+### Leaflet Plot --------------------------------------------------------------
+library(leaflet)
 
+gageMeta <-
+  gageMeta %>%
+  mutate(
+    nYears = year(end_date) - year(begin_date)
+  )
 
+pal <- colorNumeric("Blues", sort(gageMeta$nYears))
+
+l <- leaflet(gageMeta) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lng = ~dec_long_va,
+    lat = ~dec_lat_va,
+    popup = ~sprintf("%s<br># Years:\t%g<br>Start Date:\t%s<br>End Date:\t%s",
+                     station_nm,
+                     nYears,
+                     as.character(begin_date),
+                     as.character(end_date)),
+    stroke = T,
+    color = "black",
+    weight = 1,
+    opacity = 1,
+    fill = T,
+    fillColor = ~pal(nYears),
+    fillOpacity = 1,
+    radius = 4,
+    label = ~station_nm
+  )
+
+l
+
+htmlwidgets::saveWidget(l, "data/html/missouri_usgs.html")
